@@ -767,6 +767,68 @@ end:
 		event_base_loop(base, EVLOOP_ONCE);
 }
 
+static void
+get_error_eventcb(struct bufferevent *bev, short what, void *ctx)
+{
+	short *events = ctx;
+	TT_BLATHER(("Got event %d", (int)what));
+	*events |= what;
+	event_base_loopexit(bufferevent_get_base(bev), NULL);
+}
+
+static void
+regress_bufferevent_ssl_get_error(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *plain = NULL, *bev = NULL;
+	struct timeval t = { 10, 0 };
+	const char garbage[] = "GET / HTTP/1.0\r\n\r\n";
+	short events = 0;
+	unsigned long err;
+	int n_errors = 0;
+	SSL *ssl;
+
+	/* Not an SSL bufferevent: must return 0 instead of asserting. */
+	plain = bufferevent_socket_new(data->base, data->pair[0], 0);
+	tt_assert(plain);
+	tt_int_op(bufferevent_ssl_get_error(plain), ==, 0);
+	bufferevent_free(plain);
+	plain = NULL;
+
+	/* SSL server fed with non-TLS data: the error must be reported. */
+	ssl = SSL_new(get_ssl_ctx(SSL_IS_SERVER));
+	SSL_use_certificate(ssl, the_cert);
+	SSL_use_PrivateKey(ssl, the_key);
+	bev = bufferevent_ssl_socket_new(data->base, data->pair[0], ssl,
+	    BUFFEREVENT_SSL_ACCEPTING, 0);
+	tt_assert(bev);
+	tt_int_op(bufferevent_ssl_get_error(bev), ==, 0);
+
+	bufferevent_setcb(bev, NULL, NULL, get_error_eventcb, &events);
+	bufferevent_set_timeouts(bev, &t, &t);
+	bufferevent_enable(bev, EV_READ|EV_WRITE);
+	tt_int_op(write(data->pair[1], garbage, sizeof(garbage) - 1), ==,
+	    sizeof(garbage) - 1);
+
+	event_base_dispatch(data->base);
+
+	tt_int_op(events & BEV_EVENT_ERROR, ==, BEV_EVENT_ERROR);
+	tt_int_op(events & BEV_EVENT_TIMEOUT, ==, 0);
+	while ((err = bufferevent_ssl_get_error(bev))) {
+		TT_BLATHER(("SSL error %lu", err));
+		++n_errors;
+	}
+	tt_int_op(n_errors, >, 0);
+	/* The error queue is drained after reading. */
+	tt_int_op(bufferevent_ssl_get_error(bev), ==, 0);
+
+end:
+	if (plain)
+		bufferevent_free(plain);
+	if (bev)
+		bufferevent_free(bev);
+}
+
 struct testcase_t TESTCASES_NAME[] = {
 #define T(a) ((void *)(a))
 	{ "bufferevent_socketpair", regress_bufferevent_openssl,
@@ -854,6 +916,9 @@ struct testcase_t TESTCASES_NAME[] = {
 	  TT_FORK|TT_NEED_BASE, &ssl_setup, T(REGRESS_DEFERRED_CALLBACKS) },
 	{ "bufferevent_wm_filter_defer", regress_bufferevent_openssl_wm,
 	  TT_FORK|TT_NEED_BASE, &ssl_setup, T(REGRESS_OPENSSL_FILTER|REGRESS_DEFERRED_CALLBACKS) },
+
+	{ "bufferevent_get_error", regress_bufferevent_ssl_get_error,
+	  TT_ISOLATED, &ssl_setup, NULL },
 
 #undef T
 
